@@ -37,6 +37,12 @@ PARAMETERS:
         Global normalization requires two passes through all images (slower but consistent).
         Example: --global-normalize
 
+    --workers (optional, default: CPU count - 1)
+        Number of parallel worker processes for faster processing.
+        Uses multiprocessing to parallelize image loading and processing.
+        Default uses all available CPU cores minus one.
+        Example: --workers 4
+
 USAGE EXAMPLES:
     Basic usage with required input directory (local normalization):
         python create_video.py /path/to/tiff_images
@@ -50,8 +56,11 @@ USAGE EXAMPLES:
     With global normalization (consistent brightness across all frames):
         python create_video.py /path/to/tiff_images --global-normalize
 
+    With parallel processing (faster on multi-core systems):
+        python create_video.py /path/to/tiff_images --workers 8
+
     Full customization:
-        python create_video.py /path/to/tiff_images --output output.mp4 --width 1000 --fps 20 --crop 600x600 --anchor --global-normalize
+        python create_video.py /path/to/tiff_images --output output.mp4 --width 1000 --fps 20 --crop 600x600 --anchor --global-normalize --workers 8
 """
 
 import cv2
@@ -65,27 +74,101 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
 import sys
 import io
+import multiprocessing as mp
+from multiprocessing import Pool, Queue, Process
+import time
+from functools import partial
 
 
-def find_global_min_max(image_paths):
+# ============================================================================
+# Multiprocessing Helper Functions
+# ============================================================================
+
+def _process_image_min_max(img_path):
     """
-    Scan all images to find global min and max pixel values.
+    Worker function to find min/max values in a single image.
+
+    Args:
+        img_path: Path to TIF image
+
+    Returns:
+        tuple: (min_value, max_value)
+    """
+    try:
+        img = Image.open(img_path)
+        img_array = np.array(img)
+        return (img_array.min(), img_array.max())
+    except Exception as e:
+        print(f"Warning: Error processing {img_path}: {e}")
+        return (np.inf, -np.inf)
+
+
+def _process_frame_worker(img_path, norm_min, norm_max, target_width, crop_size):
+    """
+    Worker function to load and preprocess a single frame.
+
+    Args:
+        img_path: Path to TIF image
+        norm_min: Minimum pixel value for normalization
+        norm_max: Maximum pixel value for normalization
+        target_width: Target width in pixels
+        crop_size: Optional tuple (width, height) for center cropping
+
+    Returns:
+        numpy.ndarray: Processed frame (8-bit, resized)
+    """
+    try:
+        # Load 16-bit image
+        img = Image.open(img_path)
+        img_array = np.array(img)
+
+        # If using local normalization, calculate per-frame min/max
+        if norm_min is None:
+            frame_min, frame_max = img_array.min(), img_array.max()
+        else:
+            frame_min, frame_max = norm_min, norm_max
+
+        # Normalize and resize (with optional crop)
+        frame = normalize_and_resize(img_array, frame_min, frame_max, target_width, crop_size)
+
+        return frame
+    except Exception as e:
+        print(f"Warning: Error processing frame {img_path}: {e}")
+        return None
+
+
+# ============================================================================
+# Original Functions (Updated for Parallel Processing)
+# ============================================================================
+
+def find_global_min_max(image_paths, num_workers=None):
+    """
+    Scan all images to find global min and max pixel values using parallel processing.
 
     Args:
         image_paths: List of paths to TIF images
+        num_workers: Number of worker processes (default: CPU count - 1)
 
     Returns:
         tuple: (global_min, global_max)
     """
-    print("Pass 1: Finding global min/max values for normalization...")
-    global_min = np.inf
-    global_max = -np.inf
+    if num_workers is None:
+        num_workers = max(1, mp.cpu_count() - 1)
 
-    for img_path in tqdm(image_paths, desc="Scanning images"):
-        img = Image.open(img_path)
-        img_array = np.array(img)
-        global_min = min(global_min, img_array.min())
-        global_max = max(global_max, img_array.max())
+    print(f"Pass 1: Finding global min/max values for normalization... (using {num_workers} workers)")
+
+    # Use multiprocessing pool to process images in parallel
+    with Pool(processes=num_workers) as pool:
+        # Map the worker function across all image paths with progress bar
+        results = list(tqdm(
+            pool.imap(_process_image_min_max, image_paths),
+            total=len(image_paths),
+            desc="Scanning images"
+        ))
+
+    # Reduce results to find global min/max
+    global_min = min(r[0] for r in results)
+    global_max = max(r[1] for r in results)
 
     print(f"Global min: {global_min}, Global max: {global_max}")
     return global_min, global_max
@@ -190,9 +273,9 @@ def normalize_and_resize(img_array, norm_min, norm_max, target_width, crop_size=
     return resized
 
 
-def create_video(input_dir, output_path, target_width=500, fps=10, crop_size=None, show_anchor=False, use_global_normalize=False):
+def create_video(input_dir, output_path, target_width=500, fps=10, crop_size=None, show_anchor=False, use_global_normalize=False, num_workers=None):
     """
-    Create video from TIF images with local or global normalization.
+    Create video from TIF images with local or global normalization using parallel processing.
 
     Args:
         input_dir: Directory containing TIF images
@@ -202,7 +285,12 @@ def create_video(input_dir, output_path, target_width=500, fps=10, crop_size=Non
         crop_size: Optional tuple (width, height) for center cropping
         show_anchor: If True, add red dot at center of each frame
         use_global_normalize: If True, use global min/max for consistent brightness (2 passes)
+        num_workers: Number of worker processes (default: CPU count - 1)
     """
+    start_time = time.time()
+
+    if num_workers is None:
+        num_workers = max(1, mp.cpu_count() - 1)
     input_dir = Path(input_dir)
 
     # Find all TIF files and sort by filename
@@ -224,7 +312,7 @@ def create_video(input_dir, output_path, target_width=500, fps=10, crop_size=Non
     if use_global_normalize:
         print("Normalization: Global (consistent brightness across all frames)")
         # Pass 1: Find global min/max
-        norm_min, norm_max = find_global_min_max(image_paths)
+        norm_min, norm_max = find_global_min_max(image_paths, num_workers=num_workers)
     else:
         print("Normalization: Local (per-frame, faster processing)")
         # For local normalization, we'll calculate min/max per image
@@ -263,33 +351,45 @@ def create_video(input_dir, output_path, target_width=500, fps=10, crop_size=Non
         print("Error: Could not open video writer")
         return
 
-    # Process images and write to video
+    # Process images and write to video using parallel processing
     pass_label = "Pass 2: Creating video..." if use_global_normalize else "Creating video..."
-    print(f"\n{pass_label}")
-    for img_path in tqdm(image_paths, desc="Processing frames"):
-        # Load 16-bit image
-        img = Image.open(img_path)
-        img_array = np.array(img)
+    print(f"\n{pass_label} (using {num_workers} workers)")
 
-        # Calculate normalization values (local or global)
-        if use_global_normalize:
-            frame_min, frame_max = norm_min, norm_max
-        else:
-            frame_min, frame_max = get_local_min_max(img_array)
+    # Create partial function with fixed parameters
+    process_func = partial(
+        _process_frame_worker,
+        norm_min=norm_min,
+        norm_max=norm_max,
+        target_width=target_width,
+        crop_size=crop_size
+    )
 
-        # Normalize and resize (with optional crop)
-        frame = normalize_and_resize(img_array, frame_min, frame_max, target_width, crop_size)
+    # Process frames in parallel using multiprocessing pool
+    with Pool(processes=num_workers) as pool:
+        # Use imap to maintain order and process with progress bar
+        for frame in tqdm(
+            pool.imap(process_func, image_paths),
+            total=len(image_paths),
+            desc="Processing frames"
+        ):
+            if frame is not None:
+                # Add anchor point if requested (must be done sequentially)
+                if show_anchor:
+                    frame = add_anchor_point(frame)
 
-        # Add anchor point if requested
-        if show_anchor:
-            frame = add_anchor_point(frame)
-
-        # Write frame to video
-        video_writer.write(frame)
+                # Write frame to video (must be done sequentially)
+                video_writer.write(frame)
 
     video_writer.release()
+
+    # Calculate and display performance metrics
+    elapsed_time = time.time() - start_time
+    frames_per_second = len(image_paths) / elapsed_time if elapsed_time > 0 else 0
+
     print(f"\nVideo created successfully: {output_path}")
     print(f"Video info: {width}x{height}, {fps} fps, {len(image_paths)} frames")
+    print(f"Processing time: {elapsed_time:.2f} seconds ({frames_per_second:.2f} frames/sec)")
+    print(f"Workers used: {num_workers}")
 
 
 class TextRedirector(io.StringIO):
@@ -639,7 +739,7 @@ class VideoCreatorGUI:
                     # Generate output path for this directory
                     output_path = Path(input_dir) / filename
 
-                    # Call the create_video function
+                    # Call the create_video function with multiprocessing enabled
                     create_video(
                         input_dir=input_dir,
                         output_path=str(output_path),
@@ -647,7 +747,8 @@ class VideoCreatorGUI:
                         fps=fps,
                         crop_size=crop_size,
                         show_anchor=show_anchor,
-                        use_global_normalize=use_global_normalize
+                        use_global_normalize=use_global_normalize,
+                        num_workers=None  # Use default (CPU count - 1)
                     )
 
                     successful += 1
@@ -762,6 +863,12 @@ Examples:
         action="store_true",
         help="Use global min/max normalization for consistent brightness across all frames (requires 2 passes, slower)"
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help=f"Number of parallel worker processes (default: {max(1, mp.cpu_count() - 1)} = CPU count - 1)"
+    )
 
     args = parser.parse_args()
 
@@ -792,7 +899,8 @@ Examples:
             fps=args.fps,
             crop_size=crop_size,
             show_anchor=args.anchor,
-            use_global_normalize=args.global_normalize
+            use_global_normalize=args.global_normalize,
+            num_workers=args.workers
         )
     else:
         # GUI mode (default)
@@ -802,4 +910,6 @@ Examples:
 
 
 if __name__ == "__main__":
+    # Required for multiprocessing on Windows and macOS
+    mp.freeze_support()
     main()
