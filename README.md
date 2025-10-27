@@ -193,6 +193,20 @@ python3 create_video.py --nogui /path/to/tiff_images \
   - **Global:** All frames share the same min/max values for normalization. Consistent brightness across the entire video, but requires two passes (slower).
 - **Usage:** `--global-normalize` (CLI) or checkbox (GUI)
 
+### Parallel Workers
+
+- **Default:** 1 worker (safest for HDD)
+- **Range:** 1 to number of CPU cores
+- **Description:** Controls the number of parallel workers used during global normalization's scanning phase (Pass 1). More workers = faster processing, but can cause I/O saturation on slower storage devices.
+- **Recommendations:**
+  - **HDD (Hard Disk Drive):** Use 1 worker (default) to avoid I/O bottlenecks
+  - **SSD (Solid State Drive):** Can safely use 2-4 workers for faster processing
+  - **NVMe SSD:** Can use up to cpu_count/2 workers
+  - **If unsure:** Start with 1 and gradually increase while monitoring performance
+- **Usage:** 
+  - CLI: `--workers 2`
+  - GUI: Adjust "Parallel workers" spinbox (only enabled when global normalization is checked)
+
 ## Output Files
 
 Output videos are automatically saved in the input directory with descriptive filenames based on processing parameters:

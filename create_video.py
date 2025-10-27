@@ -97,22 +97,23 @@ def _process_image_minmax(image_path):
         return (float('inf'), float('-inf'))
 
 
-def find_global_min_max(image_paths):
+def find_global_min_max(image_paths, num_workers=1):
     """
     Scan all images to find global min and max pixel values using parallel processing.
 
     Args:
         image_paths: List of paths to TIF images
+        num_workers: Number of parallel workers to use (default: 1)
 
     Returns:
         tuple: (global_min, global_max)
     """
     print("Pass 1: Finding global min/max values for normalization...")
     
-    # Determine number of workers (use 1/4 of CPU cores for HDD optimization)
+    # Validate and use provided number of workers
     total_cores = mp.cpu_count()
-    num_workers = max(1, total_cores // 4)
-    print(f"Using {num_workers} workers (1/4 of {total_cores} CPU cores) - optimized for HDD")
+    num_workers = max(1, min(num_workers, total_cores))  # Clamp between 1 and total_cores
+    print(f"Using {num_workers} worker(s) out of {total_cores} available CPU cores")
     
     # Convert paths to strings for serialization
     work_items = [str(path) for path in image_paths]
@@ -234,7 +235,7 @@ def normalize_and_resize(img_array, norm_min, norm_max, target_width, crop_size=
     return resized
 
 
-def create_video(input_dir, output_path, target_width=500, fps=10, crop_size=None, show_anchor=False, use_global_normalize=False):
+def create_video(input_dir, output_path, target_width=500, fps=10, crop_size=None, show_anchor=False, use_global_normalize=False, num_workers=1):
     """
     Create video from TIF images with local or global normalization.
 
@@ -246,6 +247,7 @@ def create_video(input_dir, output_path, target_width=500, fps=10, crop_size=Non
         crop_size: Optional tuple (width, height) for center cropping
         show_anchor: If True, add red dot at center of each frame
         use_global_normalize: If True, use global min/max for consistent brightness (2 passes)
+        num_workers: Number of parallel workers for global normalization (default: 1)
     """
     input_dir = Path(input_dir)
 
@@ -268,7 +270,7 @@ def create_video(input_dir, output_path, target_width=500, fps=10, crop_size=Non
     if use_global_normalize:
         print("Normalization: Global (consistent brightness across all frames)")
         # Pass 1: Find global min/max
-        norm_min, norm_max = find_global_min_max(image_paths)
+        norm_min, norm_max = find_global_min_max(image_paths, num_workers)
     else:
         print("Normalization: Local (per-frame, faster processing)")
         # For local normalization, we'll calculate min/max per image
@@ -476,7 +478,18 @@ class VideoCreatorGUI:
         # Global normalize
         self.global_normalize_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(main_frame, text="Use global normalization (consistent brightness, slower)",
-                        variable=self.global_normalize_var, command=self.update_output_filename).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=5)
+                        variable=self.global_normalize_var, command=self.toggle_global_normalize).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=5)
+        row += 1
+
+        # Workers control (for global normalization)
+        workers_frame = ttk.Frame(main_frame)
+        workers_frame.grid(row=row, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
+
+        ttk.Label(workers_frame, text="Parallel workers:").grid(row=0, column=0, sticky=tk.W, padx=(20, 5))
+        self.workers_var = tk.IntVar(value=1)
+        self.workers_spinbox = ttk.Spinbox(workers_frame, from_=1, to=mp.cpu_count(), textvariable=self.workers_var, width=10, state='disabled')
+        self.workers_spinbox.grid(row=0, column=1, padx=5)
+        ttk.Label(workers_frame, text=f"(1 = safest for HDD, max = {mp.cpu_count()})").grid(row=0, column=2, sticky=tk.W, padx=5)
         row += 1
 
         # Create video button
@@ -503,6 +516,12 @@ class VideoCreatorGUI:
         state = 'normal' if self.crop_enabled_var.get() else 'disabled'
         self.crop_width_spinbox.config(state=state)
         self.crop_height_spinbox.config(state=state)
+        self.update_output_filename()
+
+    def toggle_global_normalize(self):
+        """Enable/disable workers spinbox based on global normalization checkbox."""
+        state = 'normal' if self.global_normalize_var.get() else 'disabled'
+        self.workers_spinbox.config(state=state)
         self.update_output_filename()
 
     def update_output_filename(self):
@@ -661,6 +680,7 @@ class VideoCreatorGUI:
             fps = self.fps_var.get()
             show_anchor = self.anchor_var.get()
             use_global_normalize = self.global_normalize_var.get()
+            num_workers = self.workers_var.get()
 
             # Build filename pattern
             width = target_width
@@ -691,7 +711,8 @@ class VideoCreatorGUI:
                         fps=fps,
                         crop_size=crop_size,
                         show_anchor=show_anchor,
-                        use_global_normalize=use_global_normalize
+                        use_global_normalize=use_global_normalize,
+                        num_workers=num_workers
                     )
 
                     successful += 1
@@ -806,6 +827,12 @@ Examples:
         action="store_true",
         help="Use global min/max normalization for consistent brightness across all frames (requires 2 passes, slower)"
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for global normalization (default: 1, recommended for HDD)"
+    )
 
     args = parser.parse_args()
 
@@ -836,7 +863,8 @@ Examples:
             fps=args.fps,
             crop_size=crop_size,
             show_anchor=args.anchor,
-            use_global_normalize=args.global_normalize
+            use_global_normalize=args.global_normalize,
+            num_workers=args.workers
         )
     else:
         # GUI mode (default)
