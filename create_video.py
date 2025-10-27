@@ -54,6 +54,14 @@ USAGE EXAMPLES:
         python create_video.py /path/to/tiff_images --output output.mp4 --width 1000 --fps 20 --crop 600x600 --anchor --global-normalize
 """
 
+# Limit threading in numerical libraries to prevent CPU overload
+# Each worker process should use only 1 thread
+import os
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
 import cv2
 import numpy as np
 from PIL import Image
@@ -65,11 +73,33 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
 import sys
 import io
+import multiprocessing as mp
+from multiprocessing import Pool
+
+
+def _process_image_minmax(image_path):
+    """
+    Worker function: Process a single image to find its min and max values.
+    
+    Args:
+        image_path: Path to TIF image (string or Path object)
+    
+    Returns:
+        tuple: (min_value, max_value)
+    """
+    try:
+        img = Image.open(image_path)
+        img_array = np.array(img)
+        return (float(img_array.min()), float(img_array.max()))
+    except Exception as e:
+        # Return infinite values if image cannot be processed
+        # These will be filtered out when finding global min/max
+        return (float('inf'), float('-inf'))
 
 
 def find_global_min_max(image_paths):
     """
-    Scan all images to find global min and max pixel values.
+    Scan all images to find global min and max pixel values using parallel processing.
 
     Args:
         image_paths: List of paths to TIF images
@@ -78,15 +108,29 @@ def find_global_min_max(image_paths):
         tuple: (global_min, global_max)
     """
     print("Pass 1: Finding global min/max values for normalization...")
-    global_min = np.inf
-    global_max = -np.inf
-
-    for img_path in tqdm(image_paths, desc="Scanning images"):
-        img = Image.open(img_path)
-        img_array = np.array(img)
-        global_min = min(global_min, img_array.min())
-        global_max = max(global_max, img_array.max())
-
+    
+    # Determine number of workers (use 1/4 of CPU cores for HDD optimization)
+    total_cores = mp.cpu_count()
+    num_workers = max(1, total_cores // 4)
+    print(f"Using {num_workers} workers (1/4 of {total_cores} CPU cores) - optimized for HDD")
+    
+    # Convert paths to strings for serialization
+    work_items = [str(path) for path in image_paths]
+    
+    # Process in parallel with progress bar
+    all_results = []
+    
+    with Pool(processes=num_workers) as pool:
+        # Use imap_unordered for streaming results with progress tracking
+        with tqdm(total=len(work_items), desc="Scanning images", unit="image", ncols=100) as pbar:
+            for result in pool.imap_unordered(_process_image_minmax, work_items, chunksize=10):
+                all_results.append(result)
+                pbar.update(1)
+    
+    # Find global min/max from all results
+    global_min = min(min_val for min_val, max_val in all_results if min_val != float('inf'))
+    global_max = max(max_val for min_val, max_val in all_results if max_val != float('-inf'))
+    
     print(f"Global min: {global_min}, Global max: {global_max}")
     return global_min, global_max
 
