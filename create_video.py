@@ -75,6 +75,12 @@ import sys
 import io
 import multiprocessing as mp
 from multiprocessing import Pool
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for threading
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib.gridspec import GridSpec
+import glob
 
 
 def _process_image_minmax(image_path):
@@ -338,6 +344,265 @@ def create_video(input_dir, output_path, target_width=500, fps=10, crop_size=Non
     print(f"Video info: {width}x{height}, {fps} fps, {len(image_paths)} frames")
 
 
+def load_tiff_as_array(filepath):
+    """Load a TIFF file and return it as a numpy array."""
+    try:
+        img = Image.open(filepath)
+        return np.array(img, dtype=np.float64)
+    except Exception as e:
+        print(f"Error loading {filepath}: {e}")
+        return None
+
+
+def normalize_image(image_array, reference_array):
+    """Normalize an image array pixel-wise using a reference array."""
+    with np.errstate(divide='ignore', invalid='ignore'):
+        normalized = np.divide(image_array, reference_array)
+        normalized[reference_array == 0] = 0
+    return normalized
+
+
+def get_sorted_tiff_files(directory):
+    """Get all TIFF files from directory sorted numerically."""
+    directory = Path(directory)
+    tiff_files = list(directory.glob("*.tif")) + list(directory.glob("*.tiff"))
+    
+    def get_number(filepath):
+        basename = filepath.stem
+        # Try to extract number from filename
+        try:
+            return int(basename)
+        except ValueError:
+            # If not purely numeric, return string for alphabetical sort
+            return basename
+    
+    return sorted(tiff_files, key=get_number)
+
+
+def parse_time_from_filename(filename):
+    """Parse time from filename format: HHMMSSMSEC (9 digits).
+    
+    Args:
+        filename: e.g., '130329578.tif' or Path object
+        
+    Returns:
+        Time in seconds (float), or None if parsing fails
+    """
+    try:
+        if isinstance(filename, Path):
+            basename = filename.stem
+        else:
+            basename = os.path.splitext(os.path.basename(filename))[0]
+        
+        if len(basename) != 9 or not basename.isdigit():
+            return None
+            
+        hours = int(basename[0:2])
+        minutes = int(basename[2:4])
+        seconds = int(basename[4:6])
+        milliseconds = int(basename[6:9])
+        
+        total_seconds = hours * 3600 + minutes * 60 + seconds + milliseconds / 1000.0
+        return total_seconds
+    except Exception as e:
+        print(f"Error parsing time from {filename}: {e}")
+        return None
+
+
+def create_normalized_video_with_colormap(input_dir, output_path, fps=1, use_timestamps=False):
+    """
+    Create normalized video with BWR colormap, dynamic colorbar, and optional timestamps.
+    
+    Args:
+        input_dir: Directory containing TIFF images
+        output_path: Output video file path
+        fps: Frames per second (default: 1)
+        use_timestamps: If True, parse HHMMSSMSEC format and display timestamps
+    
+    Video specs:
+        - Fixed size: 14x10 inches at 150 DPI = 2100x1500 pixels
+        - Normalization: divide by first image (reference)
+        - Color scaling: mean ± 3*std (dynamic per frame)
+        - Colormap: BWR (blue-white-red)
+        - High quality: libx264, CRF 18, 15 Mbps
+    """
+    print("=" * 60)
+    print("Normalized Image Video Generator (with Colormap)")
+    print("=" * 60)
+    
+    # Get all TIFF files
+    print(f"\nScanning directory: {input_dir}")
+    tiff_files = get_sorted_tiff_files(input_dir)
+    
+    if not tiff_files:
+        print(f"Error: No TIFF files found in {input_dir}")
+        return
+    
+    print(f"Found {len(tiff_files)} TIFF images")
+    
+    # Load reference image (first image)
+    ref_file = tiff_files[0]
+    print(f"\nLoading reference image: {ref_file.name}")
+    ref_array = load_tiff_as_array(ref_file)
+    
+    if ref_array is None:
+        print("Error: Failed to load reference image")
+        return
+    
+    print(f"Reference image shape: {ref_array.shape}")
+    
+    # Parse timestamps if requested
+    time_deltas = None
+    if use_timestamps:
+        print("\nParsing timestamps...")
+        first_time = parse_time_from_filename(tiff_files[0])
+        
+        if first_time is None:
+            print(f"Error: Cannot parse timestamp from first file: {tiff_files[0].name}")
+            print("Expected format: HHMMSSMSEC (9 digits)")
+            return
+        
+        time_deltas = []
+        for f in tiff_files:
+            current_time = parse_time_from_filename(f)
+            if current_time is None:
+                print(f"Error: Cannot parse timestamp from {f.name}")
+                print("Expected format: HHMMSSMSEC (9 digits)")
+                return
+            time_deltas.append(current_time - first_time)
+        
+        print(f"Time range: {time_deltas[0]:.3f}s to {time_deltas[-1]:.3f}s")
+    
+    # Load and normalize all images
+    print("\nLoading and normalizing images...")
+    normalized_images = []
+    
+    for i, f in enumerate(tiff_files):
+        if i % 20 == 0 or i == len(tiff_files) - 1:
+            print(f"  Processing image {i+1}/{len(tiff_files)}...")
+        
+        img_array = load_tiff_as_array(f)
+        if img_array is None:
+            print(f"Error: Failed to load {f.name}")
+            return
+        
+        normalized = normalize_image(img_array, ref_array)
+        normalized_images.append(normalized)
+    
+    print(f"Successfully normalized {len(normalized_images)} images")
+    
+    # Set up figure with GridSpec
+    print("\nSetting up visualization...")
+    fig = plt.figure(figsize=(14, 10))
+    
+    # Create GridSpec: image on left, colorbar on right
+    gs = GridSpec(1, 2, figure=fig, width_ratios=[20, 1], wspace=0.15)
+    
+    ax_img = fig.add_subplot(gs[0, 0])
+    ax_cbar = fig.add_subplot(gs[0, 1])
+    
+    # Initial plot (will be updated in animation)
+    initial_normalized = normalized_images[0]
+    mean_val = np.mean(initial_normalized)
+    std_val = np.std(initial_normalized)
+    vmin = mean_val - 3 * std_val
+    vmax = mean_val + 3 * std_val
+    
+    im = ax_img.imshow(initial_normalized, cmap='bwr', vmin=vmin, vmax=vmax)
+    ax_img.set_xlabel('X Pixel', fontsize=12)
+    ax_img.set_ylabel('Y Pixel', fontsize=12)
+    
+    # Initial colorbar
+    cbar = plt.colorbar(im, cax=ax_cbar)
+    cbar.set_label('Normalized Intensity', fontsize=12)
+    
+    # Title will be updated in animation
+    if use_timestamps:
+        title_text = f'Time: {time_deltas[0]:.3f}s'
+    else:
+        title_text = f'Frame: 1/{len(normalized_images)}'
+    title = ax_img.set_title(title_text, fontsize=14, fontweight='bold')
+    
+    fig.tight_layout()
+    
+    # Animation update function
+    def update_frame(frame_idx):
+        """Update function for animation."""
+        normalized = normalized_images[frame_idx]
+        
+        # Calculate dynamic color limits
+        mean_val = np.mean(normalized)
+        std_val = np.std(normalized)
+        min_val = np.min(normalized)
+        max_val = np.max(normalized)
+        
+        vmin = max(mean_val - 3 * std_val, min_val)
+        vmax = min(mean_val + 3 * std_val, max_val)
+        
+        # Update image and color limits
+        im.set_data(normalized)
+        im.set_clim(vmin=vmin, vmax=vmax)
+        
+        # Update title with timestamp or frame number
+        if use_timestamps:
+            title_text = f'Time: {time_deltas[frame_idx]:.3f}s'
+        else:
+            title_text = f'Frame: {frame_idx+1}/{len(normalized_images)}'
+        title.set_text(title_text)
+        
+        # Update colorbar (need to redraw it)
+        cbar.update_normal(im)
+        
+        if frame_idx % 20 == 0 or frame_idx == len(normalized_images) - 1:
+            print(f"  Rendering frame {frame_idx+1}/{len(normalized_images)}...")
+        
+        return [im, title]
+    
+    # Create animation
+    print(f"\nCreating animation at {fps} fps...")
+    anim = animation.FuncAnimation(
+        fig, update_frame, frames=len(normalized_images),
+        interval=1000/fps, blit=False, repeat=False
+    )
+    
+    # Save video with high quality settings
+    print(f"Saving video to: {output_path}")
+    print("This may take several minutes...")
+    
+    # FFmpeg writer with high quality settings
+    try:
+        Writer = animation.writers['ffmpeg']
+        writer = Writer(
+            fps=fps,
+            metadata=dict(artist='Normalized Image Video Generator'),
+            bitrate=15000,  # High bitrate for quality: 15 Mbps
+            codec='libx264',
+            extra_args=['-pix_fmt', 'yuv420p', '-preset', 'slow', '-crf', '18']
+            # CRF 18 = visually lossless quality
+        )
+        
+        anim.save(output_path, writer=writer, dpi=150)
+        print("\n" + "=" * 60)
+        print("SUCCESS! Normalized video created successfully!")
+        print("=" * 60)
+        print(f"\nOutput file: {output_path}")
+        print(f"Number of frames: {len(normalized_images)}")
+        print(f"Frame rate: {fps} fps")
+        print(f"Duration: {len(normalized_images)/fps:.1f} seconds")
+        
+        # Get file size
+        file_size = os.path.getsize(output_path) / (1024 * 1024)  # MB
+        print(f"File size: {file_size:.2f} MB")
+        
+    except Exception as e:
+        print(f"\nError saving video: {e}")
+        print("\nTroubleshooting:")
+        print("- Ensure ffmpeg is installed: sudo apt-get install ffmpeg")
+        print("- Check disk space availability")
+    finally:
+        plt.close(fig)
+
+
 class TextRedirector(io.StringIO):
     """Redirects stdout/stderr to a tkinter Text widget."""
     def __init__(self, text_widget):
@@ -495,6 +760,26 @@ class VideoCreatorGUI:
         # Create video button
         self.create_button = ttk.Button(main_frame, text="Create Video", command=self.start_video_creation)
         self.create_button.grid(row=row, column=0, columnspan=2, pady=15)
+        row += 1
+
+        # Separator
+        ttk.Separator(main_frame, orient='horizontal').grid(row=row, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=10)
+        row += 1
+
+        # Normalized video section
+        ttk.Label(main_frame, text="Normalized Video (with colormap):", font=("", 10, "bold")).grid(row=row, column=0, sticky=tk.W, pady=5)
+        row += 1
+
+        # Timestamp checkbox
+        self.timestamp_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(main_frame, text="Filenames have HHMMSSMSEC format (enables timestamp display)",
+                        variable=self.timestamp_var).grid(row=row, column=0, columnspan=2, sticky=tk.W, pady=5)
+        row += 1
+
+        # Create normalized video button
+        self.create_normalized_button = ttk.Button(main_frame, text="Create Normalized Video",
+                                                    command=self.start_normalized_video_creation)
+        self.create_normalized_button.grid(row=row, column=0, columnspan=2, pady=15)
         row += 1
 
         # Status/output area
@@ -756,6 +1041,102 @@ class VideoCreatorGUI:
 
             # Re-enable button
             self.root.after(0, lambda: self.create_button.config(state='normal', text="Create Video"))
+
+    def start_normalized_video_creation(self):
+        """Start normalized video creation in a separate thread."""
+        if not self.validate_inputs():
+            return
+
+        # Disable buttons during processing
+        self.create_normalized_button.config(state='disabled', text="Processing...")
+        self.create_button.config(state='disabled')
+        self.status_text.delete(1.0, tk.END)
+        self.log_message("Starting normalized video creation...\n\n")
+
+        # Start processing in separate thread
+        self.processing_thread = threading.Thread(target=self.create_normalized_video_thread, daemon=True)
+        self.processing_thread.start()
+
+    def create_normalized_video_thread(self):
+        """Thread function to create normalized videos for all directories without blocking GUI."""
+        # Redirect stdout to GUI
+        old_stdout = sys.stdout
+        sys.stdout = TextRedirector(self.status_text)
+
+        total_dirs = len(self.input_directories)
+        successful = 0
+        failed = 0
+        failed_dirs = []
+
+        try:
+            # Get parameters (only fps and timestamp for normalized video)
+            fps = self.fps_var.get()
+            use_timestamps = self.timestamp_var.get()
+
+            # Build filename pattern for normalized video
+            filename = f"normalized_{fps}fps_video.mp4"
+
+            # Process each directory
+            for idx, input_dir in enumerate(self.input_directories, start=1):
+                print(f"\n{'='*80}")
+                print(f"Processing directory {idx} of {total_dirs}")
+                print(f"Directory: {input_dir}")
+                print(f"{'='*80}\n")
+
+                try:
+                    # Generate output path for this directory
+                    output_path = Path(input_dir) / filename
+
+                    # Call the create_normalized_video_with_colormap function
+                    create_normalized_video_with_colormap(
+                        input_dir=input_dir,
+                        output_path=str(output_path),
+                        fps=fps,
+                        use_timestamps=use_timestamps
+                    )
+
+                    successful += 1
+                    print(f"\n✓ Successfully completed directory {idx}/{total_dirs}\n")
+
+                except Exception as e:
+                    failed += 1
+                    failed_dirs.append(input_dir)
+                    error_msg = f"\n✗ Error processing directory {idx}/{total_dirs}: {str(e)}\n"
+                    print(error_msg)
+
+            # Show final summary
+            print(f"\n{'='*80}")
+            print(f"BATCH PROCESSING COMPLETE")
+            print(f"{'='*80}")
+            print(f"Total directories: {total_dirs}")
+            print(f"Successful: {successful}")
+            print(f"Failed: {failed}")
+
+            if failed_dirs:
+                print(f"\nFailed directories:")
+                for d in failed_dirs:
+                    print(f"  - {d}")
+
+            # Show success/failure message
+            if failed == 0:
+                self.root.after(0, lambda: messagebox.showinfo("Success",
+                    f"All normalized videos created successfully!\n\nProcessed {successful} of {total_dirs} directories."))
+            else:
+                self.root.after(0, lambda: messagebox.showwarning("Partial Success",
+                    f"Completed with some errors.\n\nSuccessful: {successful}/{total_dirs}\nFailed: {failed}/{total_dirs}\n\nCheck the status log for details."))
+
+        except Exception as e:
+            error_msg = f"\n\nFatal error: {str(e)}\n"
+            print(error_msg)
+            self.root.after(0, lambda: messagebox.showerror("Error", f"Fatal error during batch processing:\n{str(e)}"))
+
+        finally:
+            # Restore stdout
+            sys.stdout = old_stdout
+
+            # Re-enable buttons
+            self.root.after(0, lambda: self.create_normalized_button.config(state='normal', text="Create Normalized Video"))
+            self.root.after(0, lambda: self.create_button.config(state='normal'))
 
 
 def main():

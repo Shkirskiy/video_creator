@@ -156,6 +156,133 @@ python3 create_video.py --nogui /path/to/tiff_images \
   --global-normalize
 ```
 
+## Normalized Video with Colormap
+
+In addition to standard video creation, the tool now includes a specialized **Normalized Video** mode that creates scientific visualization videos with:
+
+- **Reference-based normalization:** Each frame is divided by the first frame (reference image)
+- **BWR colormap:** Blue-White-Red color scheme for visualization
+- **Dynamic colorbar:** Shows intensity scale for each frame
+- **Timestamp support:** Optional time display for HHMMSSMSEC formatted filenames
+- **High quality:** Fixed resolution (2100×1500 pixels) with H.264 encoding at visually lossless quality (CRF 18, 15 Mbps)
+
+### When to Use Normalized Video
+
+**Best for:**
+- Comparing changes relative to an initial state/reference
+- Visualizing temporal dynamics in microscopy
+- Scientific presentations requiring colormaps
+- Data where absolute values matter less than relative changes
+
+**Not suitable for:**
+- Simple sequential display of images
+- When you need custom resolution/cropping
+- When grayscale is preferred over colormaps
+
+### GUI Workflow for Normalized Video
+
+1. **Add Input Directories** (same as standard video)
+2. **Set Frame Rate (FPS)** - this setting is shared with standard video
+3. **Enable Timestamp Display (optional):**
+   - Check "Filenames have HHMMSSMSEC format" if your files are named like: `130329578.tif`
+   - Format: 2 digits hours + 2 digits minutes + 2 digits seconds + 3 digits milliseconds
+   - Example: `130329578.tif` = 13:03:29.578
+   - If enabled, video displays: "Time: X.XXXs" (delta from first frame)
+   - If disabled, video displays: "Frame: X/Y"
+4. **Click "Create Normalized Video"**
+
+### Normalized Video Specifications
+
+**Fixed Parameters:**
+- **Resolution:** 2100×1500 pixels (14×10 inches at 150 DPI)
+- **Normalization:** Pixel-wise division by first image (reference)
+- **Color Scaling:** Dynamic per frame (mean ± 3×standard deviation)
+- **Colormap:** BWR (blue = low, white = middle, red = high)
+- **Video Quality:** H.264 codec, CRF 18 (visually lossless), 15 Mbps bitrate
+- **Output Filename:** `normalized_{fps}fps_video.mp4`
+
+**Not Applicable:**
+- Width/resolution control (fixed at 2100×1500)
+- Crop functionality
+- Anchor points
+- Global normalization (uses reference-based normalization)
+
+### Timestamp Format (HHMMSSMSEC)
+
+If your TIF filenames contain timestamps in HHMMSSMSEC format (9 digits total):
+
+| Position   | Meaning      | Example in `130329578` |
+|------------|--------------|-------------------------|
+| Digits 1-2 | Hours (HH)   | 13 = 1 PM              |
+| Digits 3-4 | Minutes (MM) | 03 = 3 minutes         |
+| Digits 5-6 | Seconds (SS) | 29 = 29 seconds        |
+| Digits 7-9 | Milliseconds (MSEC) | 578 = 578 ms  |
+
+**Time displayed in video:** Delta from the first frame in seconds (e.g., "Time: 0.000s", "Time: 1.234s", etc.)
+
+**Examples of valid filenames:**
+- `130329578.tif` → 13:03:29.578
+- `090015123.tif` → 09:00:15.123
+- `235959999.tif` → 23:59:59.999
+
+**Note:** If timestamp parsing fails for any file, the process will abort with an error message indicating which file caused the issue.
+
+### Normalized Video Examples
+
+**Example 1: Basic normalized video without timestamps**
+```bash
+# In GUI: 
+# - Add directory
+# - Keep timestamp checkbox unchecked
+# - Click "Create Normalized Video"
+
+# Result: normalized_10fps_video.mp4
+# Display: "Frame: 1/150", "Frame: 2/150", etc.
+```
+
+**Example 2: Normalized video with timestamps**
+```bash
+# In GUI:
+# - Add directory with HHMMSSMSEC formatted files
+# - Check "Filenames have HHMMSSMSEC format"
+# - Set FPS to 5
+# - Click "Create Normalized Video"
+
+# Result: normalized_5fps_video.mp4
+# Display: "Time: 0.000s", "Time: 0.200s", "Time: 0.400s", etc.
+```
+
+**Example 3: Batch processing multiple experiments**
+```bash
+# In GUI:
+# - Add multiple directories:
+#   /data/sample1/images/
+#   /data/sample2/images/
+#   /data/sample3/images/
+# - Set FPS to 1
+# - Check timestamp if applicable
+# - Click "Create Normalized Video"
+
+# Results:
+# /data/sample1/images/normalized_1fps_video.mp4
+# /data/sample2/images/normalized_1fps_video.mp4
+# /data/sample3/images/normalized_1fps_video.mp4
+```
+
+### Comparison: Standard vs Normalized Video
+
+| Feature | Standard Video | Normalized Video |
+|---------|----------------|------------------|
+| **Normalization** | Min/max (local or global) | Reference-based (÷ first frame) |
+| **Color Mode** | Grayscale | BWR colormap |
+| **Colorbar** | None | Dynamic per frame |
+| **Width Control** | User-defined (100-4000px) | Fixed (2100px) |
+| **Crop** | Yes | No |
+| **Anchor** | Yes | No |
+| **Timestamp Display** | No | Yes (optional, HHMMSSMSEC) |
+| **Video Quality** | Standard (mp4v) | High (libx264, CRF 18) |
+| **Use Case** | General viewing | Scientific visualization |
+
 ## Parameters Guide
 
 ### Video Width (pixels)
